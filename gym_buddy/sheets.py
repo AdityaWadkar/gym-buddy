@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date
 import re
+import time
 from typing import Any
 
 import gspread
@@ -36,32 +37,67 @@ HEALTH_COLUMNS = (
     "notes",
     "gym_attended",
 )
+SHEET_READ_CACHE_TTL_SECONDS = 30
 
 
 class SheetsStore:
     def __init__(self, spreadsheet: gspread.Spreadsheet) -> None:
         self._spreadsheet = spreadsheet
+        self._worksheets = {
+            worksheet.title: worksheet for worksheet in spreadsheet.worksheets()
+        }
+        self._worksheets_loaded_at = time.monotonic()
+        self._values_cache: dict[str, tuple[float, list[list[str]]]] = {}
         self._plan = self._ensure_worksheet("WorkoutPlan", PLAN_COLUMNS, 1000)
-        if len(self._plan.get_all_values()) <= 1:
+        if len(self._worksheet_values(self._plan)) <= 1:
             self.save_plan(default_plan())
 
     @staticmethod
     def _is_blank(values: Sequence[Sequence[str]]) -> bool:
         return not any(cell.strip() for row in values for cell in row)
 
+    def _refresh_worksheets_if_stale(self) -> None:
+        if time.monotonic() - self._worksheets_loaded_at < SHEET_READ_CACHE_TTL_SECONDS:
+            return
+        self._worksheets = {
+            worksheet.title: worksheet for worksheet in self._spreadsheet.worksheets()
+        }
+        self._worksheets_loaded_at = time.monotonic()
+
+    def _worksheet_values(
+        self, worksheet: gspread.Worksheet, *, refresh: bool = False
+    ) -> list[list[str]]:
+        cached = self._values_cache.get(worksheet.title)
+        if (
+            not refresh
+            and cached is not None
+            and time.monotonic() - cached[0] < SHEET_READ_CACHE_TTL_SECONDS
+        ):
+            return cached[1]
+        values = worksheet.get_all_values()
+        self._values_cache[worksheet.title] = (time.monotonic(), values)
+        return values
+
+    def _cache_worksheet_values(
+        self, worksheet: gspread.Worksheet, values: list[list[str]]
+    ) -> None:
+        self._values_cache[worksheet.title] = (time.monotonic(), values)
+
     def _ensure_worksheet(
         self, title: str, columns: Sequence[str], row_count: int
     ) -> gspread.Worksheet:
-        try:
-            worksheet = self._spreadsheet.worksheet(title)
-        except gspread.WorksheetNotFound:
+        self._refresh_worksheets_if_stale()
+        worksheet = self._worksheets.get(title)
+        if worksheet is None:
             worksheet = self._spreadsheet.add_worksheet(
                 title=title, rows=row_count, cols=len(columns)
             )
-        values = worksheet.get_all_values()
+            self._worksheets[title] = worksheet
+        values = self._worksheet_values(worksheet)
         if self._is_blank(values):
             worksheet.clear()
             worksheet.update(values=[list(columns)], range_name="A1")
+            self._cache_worksheet_values(worksheet, [list(columns)])
         elif not values[0] or not any(cell.strip() for cell in values[0]):
             raise ValueError(
                 f"The {title} worksheet has data but its header row is blank. "
@@ -74,6 +110,9 @@ class SheetsStore:
                 and existing_columns == tuple(columns[: len(existing_columns)])
             ):
                 worksheet.update(values=[list(columns)], range_name="A1")
+                self._cache_worksheet_values(
+                    worksheet, [list(columns), *values[1:]]
+                )
             else:
                 raise ValueError(
                     f"The {title} worksheet has unexpected columns. "
@@ -99,16 +138,16 @@ class SheetsStore:
         self, prefix: str, columns: Sequence[str], row_count: int
     ) -> list[gspread.Worksheet]:
         worksheets = []
-        for worksheet in self._spreadsheet.worksheets():
+        self._refresh_worksheets_if_stale()
+        for worksheet in self._worksheets.values():
             if re.fullmatch(rf"{re.escape(prefix)}_\d{{4}}", worksheet.title):
                 worksheets.append(
                     self._ensure_worksheet(worksheet.title, columns, row_count)
                 )
         return sorted(worksheets, key=lambda worksheet: worksheet.title)
 
-    @staticmethod
-    def _records(worksheet: gspread.Worksheet) -> list[dict[str, Any]]:
-        values = worksheet.get_all_values()
+    def _records(self, worksheet: gspread.Worksheet) -> list[dict[str, Any]]:
+        values = self._worksheet_values(worksheet)
         if len(values) < 2:
             return []
         headers = values[0]
@@ -139,6 +178,7 @@ class SheetsStore:
         values.extend(self._row_values(PLAN_COLUMNS, record) for record in records)
         self._plan.clear()
         self._plan.update(values=values, range_name="A1")
+        self._cache_worksheet_values(self._plan, values)
 
     def get_workout_logs(self) -> list[dict[str, Any]]:
         return [
@@ -158,25 +198,24 @@ class SheetsStore:
             for record in self._records(worksheet)
         ]
 
-    @staticmethod
     def _delete_matching_rows(
+        self,
         worksheet: gspread.Worksheet,
         headers: Sequence[str],
         predicate: Any,
     ) -> None:
-        values = worksheet.get_all_values()
+        values = self._worksheet_values(worksheet)
         if len(values) < 2:
             return
-        positions = {header: index for index, header in enumerate(headers)}
         remove: list[int] = []
         for row_number, row in enumerate(values[1:], start=2):
             record = {
-                header: row[index] if index < len(row) else ""
-                for index, header in positions.items()
+                header: row[column_index] if column_index < len(row) else ""
+                for column_index, header in enumerate(headers)
             }
             if predicate(record):
                 remove.append(row_number)
-        SheetsStore._delete_rows(worksheet, remove)
+        self._delete_rows(worksheet, remove)
 
     @staticmethod
     def _delete_rows(worksheet: gspread.Worksheet, row_numbers: Sequence[int]) -> None:
@@ -209,6 +248,7 @@ class SheetsStore:
                 for row in rows
             ]
             worksheet.append_rows(values, value_input_option="RAW")
+        self._values_cache.pop(worksheet.title, None)
 
     def save_daily_health(self, record: Mapping[str, Any]) -> None:
         log_date = str(record["date"])
@@ -227,6 +267,8 @@ class SheetsStore:
             self._row_values(HEALTH_COLUMNS, record),
             value_input_option="RAW",
         )
+        self._values_cache.pop(worksheet.title, None)
+
 
 def open_store(
     spreadsheet_id: str, service_account_info: Mapping[str, Any]

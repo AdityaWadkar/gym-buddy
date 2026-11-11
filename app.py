@@ -77,64 +77,17 @@ def _is_missing(value: Any) -> bool:
     return value is None or pd.isna(value) or str(value).strip() == ""
 
 
-def _today_workout(
+@st.dialog("Log exercise")
+def _show_exercise_logger(
     store: SheetsStore,
     today: date,
     timezone: ZoneInfo,
     weight_unit: str,
     increase_percent: float,
+    exercise: Mapping[str, Any],
+    logs: list[dict[str, Any]],
+    today_logs: list[dict[str, Any]],
 ) -> None:
-    st.header(f"Today's workout · {today.strftime('%A, %B %d')}")
-    st.caption(
-        "Your plan follows the selected timezone. A shortened session still counts "
-        "as showing up; log only the work you actually do."
-    )
-    plan = [row for row in store.get_plan() if row["day"] == today.strftime("%A")]
-    if not plan:
-        st.info("There are no exercises planned for today. You can edit the schedule below.")
-        return
-
-    mode = st.radio(
-        "Session",
-        ("Short session", "Full plan"),
-        horizontal=True,
-        help="Short session shows exercises marked Core in the editable plan.",
-    )
-    if mode == "Short session":
-        plan = [row for row in plan if row["is_core"]]
-        if not plan:
-            st.info("No exercises are marked Core for today. Choose Full plan or edit the plan.")
-            return
-
-    logs = store.get_workout_logs()
-    today_logs = [row for row in logs if str(row.get("date", ""))[:10] == today.isoformat()]
-    completed_ids = {row["exercise_id"] for row in today_logs}
-
-    st.subheader("Choose an exercise to log")
-    categories = list(dict.fromkeys(row["category"] for row in plan))
-    for category in categories:
-        st.markdown(f"**{category}**")
-        category_rows = [row for row in plan if row["category"] == category]
-        columns = st.columns(2)
-        for index, exercise in enumerate(category_rows):
-            status = "Logged" if exercise["id"] in completed_ids else "Log"
-            target = (
-                f'{exercise["target_sets"]} × {exercise["target_amount"]} '
-                f'{exercise["target_unit"]}'
-            )
-            label = f'{exercise["exercise"]} · {target} · {status}'
-            if columns[index % 2].button(
-                label,
-                key=f'choose-{today.isoformat()}-{exercise["id"]}',
-                use_container_width=True,
-            ):
-                st.session_state["active_exercise_id"] = exercise["id"]
-
-    selected_id = st.session_state.get("active_exercise_id")
-    exercise = next((row for row in plan if row["id"] == selected_id), None)
-    if exercise is None:
-        return
-
     exercise_logs = [
         row for row in logs if row.get("exercise_id") == exercise["id"]
     ]
@@ -146,8 +99,6 @@ def _today_workout(
         weight_unit,
         increase_percent,
     )
-    st.divider()
-    st.subheader(f'Log: {exercise["exercise"]}')
     st.caption(
         f'Target: {exercise["target_sets"]} sets × '
         f'{exercise["target_amount"]} {exercise["target_unit"]}'
@@ -216,48 +167,114 @@ def _today_workout(
                 ),
             },
         )
-        submitted = st.form_submit_button("Save exercise")
+        submitted = st.form_submit_button("Save exercise", type="primary")
 
-    if submitted:
-        rows_to_save = []
-        errors: list[str] = []
-        for _, row in values.iterrows():
-            actual = row["Actual amount"]
-            weight = row["Weight"]
-            if _is_missing(actual):
-                if not _is_missing(weight) and exercise["weighted"]:
-                    errors.append(f'Set {int(row["Set"])} has a weight but no actual amount.')
-                continue
-            if float(actual) < 0:
-                errors.append(f'Set {int(row["Set"])} amount cannot be negative.')
-                continue
-            if exercise["weighted"] and _is_missing(weight):
-                errors.append(f'Set {int(row["Set"])} needs a weight.')
-                continue
-            rows_to_save.append(
-                {
-                    "date": today.isoformat(),
-                    "exercise_id": exercise["id"],
-                    "exercise": exercise["exercise"],
-                    "set_number": int(row["Set"]),
-                    "target_amount": exercise["target_amount"],
-                    "actual_amount": float(actual),
-                    "target_unit": exercise["target_unit"],
-                    "weight": None if _is_missing(weight) else float(weight),
-                    "weight_unit": weight_unit if not _is_missing(weight) else "",
-                    "logged_at": datetime.now(timezone).isoformat(timespec="seconds"),
-                }
+    if not submitted:
+        return
+
+    rows_to_save = []
+    errors: list[str] = []
+    for _, row in values.iterrows():
+        actual = row["Actual amount"]
+        weight = row["Weight"]
+        if _is_missing(actual):
+            if not _is_missing(weight) and exercise["weighted"]:
+                errors.append(f'Set {int(row["Set"])} has a weight but no actual amount.')
+            continue
+        if float(actual) < 0:
+            errors.append(f'Set {int(row["Set"])} amount cannot be negative.')
+            continue
+        if exercise["weighted"] and _is_missing(weight):
+            errors.append(f'Set {int(row["Set"])} needs a weight.')
+            continue
+        rows_to_save.append(
+            {
+                "date": today.isoformat(),
+                "exercise_id": exercise["id"],
+                "exercise": exercise["exercise"],
+                "set_number": int(row["Set"]),
+                "target_amount": exercise["target_amount"],
+                "actual_amount": float(actual),
+                "target_unit": exercise["target_unit"],
+                "weight": None if _is_missing(weight) else float(weight),
+                "weight_unit": weight_unit if not _is_missing(weight) else "",
+                "logged_at": datetime.now(timezone).isoformat(timespec="seconds"),
+            }
+        )
+    if errors:
+        for error in errors:
+            st.error(error)
+    elif not rows_to_save:
+        st.warning("Enter at least one set before saving.")
+    else:
+        store.save_exercise_sets(today, exercise, rows_to_save)
+        st.rerun()
+
+
+def _today_workout(
+    store: SheetsStore,
+    today: date,
+    timezone: ZoneInfo,
+    weight_unit: str,
+    increase_percent: float,
+) -> None:
+    st.header(f"Today's workout · {today.strftime('%A, %B %d')}")
+    st.caption(
+        "Your plan follows the selected timezone. A shortened session still counts "
+        "as showing up; log only the work you actually do."
+    )
+    plan = [row for row in store.get_plan() if row["day"] == today.strftime("%A")]
+    if not plan:
+        st.info("There are no exercises planned for today. You can edit the schedule below.")
+        return
+
+    mode = st.radio(
+        "Session",
+        ("Short session", "Full plan"),
+        horizontal=True,
+        help="Short session shows exercises marked Core in the editable plan.",
+    )
+    if mode == "Short session":
+        plan = [row for row in plan if row["is_core"]]
+        if not plan:
+            st.info("No exercises are marked Core for today. Choose Full plan or edit the plan.")
+            return
+
+    logs = store.get_workout_logs()
+    today_logs = [row for row in logs if str(row.get("date", ""))[:10] == today.isoformat()]
+    completed_ids = {row["exercise_id"] for row in today_logs}
+    pending_plan = [row for row in plan if row["id"] not in completed_ids]
+    if not pending_plan:
+        st.success("All exercises in this session are logged for today.")
+        return
+
+    st.subheader("Choose an exercise to log")
+    st.caption(f"{len(pending_plan)} exercise(s) remaining.")
+    categories = list(dict.fromkeys(row["category"] for row in pending_plan))
+    for category in categories:
+        st.markdown(f"**{category}**")
+        category_rows = [row for row in pending_plan if row["category"] == category]
+        columns = st.columns(2)
+        for index, exercise in enumerate(category_rows):
+            target = (
+                f'{exercise["target_sets"]} × {exercise["target_amount"]} '
+                f'{exercise["target_unit"]}'
             )
-        if errors:
-            for error in errors:
-                st.error(error)
-        elif not rows_to_save:
-            st.warning("Enter at least one set before saving.")
-        else:
-            store.save_exercise_sets(today, exercise, rows_to_save)
-            st.session_state.pop("active_exercise_id", None)
-            st.success("Exercise saved.")
-            st.rerun()
+            if columns[index % 2].button(
+                f'{exercise["exercise"]} · {target}',
+                key=f'choose-exercise-{today.isoformat()}-{exercise["id"]}',
+                use_container_width=True,
+            ):
+                _show_exercise_logger(
+                    store,
+                    today,
+                    timezone,
+                    weight_unit,
+                    increase_percent,
+                    exercise,
+                    logs,
+                    today_logs,
+                )
 
 
 def _daily_health(store: SheetsStore, today: date) -> None:
@@ -603,7 +620,6 @@ def main() -> None:
     _login(secrets)
     if st.sidebar.button("Log out"):
         st.session_state.pop("authenticated", None)
-        st.session_state.pop("active_exercise_id", None)
         st.session_state.pop("_sheets_store", None)
         st.session_state.pop("_sheets_store_key", None)
         st.rerun()

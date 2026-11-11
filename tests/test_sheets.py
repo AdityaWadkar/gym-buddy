@@ -16,8 +16,10 @@ class FakeWorksheet:
         self.rows: list[list[str]] = []
         self.row_count = rows
         self.col_count = cols
+        self.read_count = 0
 
     def get_all_values(self) -> list[list[str]]:
+        self.read_count += 1
         return [row[:] for row in self.rows]
 
     def update(self, values: list[list[Any]], range_name: str) -> None:
@@ -81,6 +83,59 @@ def test_nonempty_plan_tab_with_wrong_headers_reports_clear_error() -> None:
 
     with pytest.raises(ValueError, match="unexpected columns"):
         SheetsStore(FakeSpreadsheet([wrong_plan]))
+
+
+def test_sheet_reads_are_reused_across_store_calls() -> None:
+    plan = FakeWorksheet("WorkoutPlan")
+    plan.rows = [list(PLAN_COLUMNS)]
+    workouts = FakeWorksheet("WorkoutSets_2026")
+    workouts.rows = [list(WORKOUT_COLUMNS), ["2026-01-05", "bench", "Bench Press"]]
+    store = SheetsStore(FakeSpreadsheet([plan, workouts]))
+
+    store.ensure_year(2026)
+    store.get_plan()
+    store.get_plan()
+    store.get_workout_logs()
+    store.get_workout_logs()
+
+    assert plan.read_count == 1
+    assert workouts.read_count == 1
+
+
+def test_saving_exercise_sets_replaces_existing_sets_for_that_exercise_and_date() -> None:
+    worksheet = FakeWorksheet("WorkoutSets_2026")
+    worksheet.rows = [
+        list(WORKOUT_COLUMNS),
+        ["2026-01-05", "bench", "Bench Press", "1", "5", "5", "reps", "50", "kg", ""],
+        ["2026-01-05", "row", "Barbell Row", "1", "8", "8", "reps", "40", "kg", ""],
+    ]
+    store = SheetsStore(FakeSpreadsheet([FakeWorksheet("WorkoutPlan"), worksheet]))
+
+    store.save_exercise_sets(
+        date(2026, 1, 5),
+        {"id": "bench", "exercise": "Bench Press"},
+        [
+            {
+                "date": "2026-01-05",
+                "exercise_id": "bench",
+                "exercise": "Bench Press",
+                "set_number": 1,
+                "target_amount": "5",
+                "actual_amount": 4,
+                "target_unit": "reps",
+                "weight": 50,
+                "weight_unit": "kg",
+                "logged_at": "",
+            }
+        ],
+    )
+
+    records = store._records(worksheet)
+    bench_sets = [row for row in records if row["exercise_id"] == "bench"]
+    assert len(bench_sets) == 1
+    assert bench_sets[0]["actual_amount"] == "4"
+    assert any(row["exercise_id"] == "row" for row in records)
+    assert worksheet.read_count == 2
 
 
 def test_activity_is_saved_to_year_tabs_and_previous_years_are_kept() -> None:
